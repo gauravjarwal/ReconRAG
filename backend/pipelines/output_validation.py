@@ -4,22 +4,12 @@ import logging
 import re
 
 from config import settings
+from pipelines.phi import detect_structured_phi
 
 logger = logging.getLogger(__name__)
 
-# Patterns for PII / sensitive data
-_CREDIT_CARD = re.compile(r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b")
-_SSN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-_EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
-
 # Citation pattern: [Source: filename | Chunk: N]
-_CITATION = re.compile(r"\[Source:\s*([^\|]+?)\s*\|\s*Chunk:\s*(\d+)\]")
-
-# Phrases that indicate the model broke character
-_PERSONA_BREAK = re.compile(
-    r"(?i)(as an? (ai|language model|llm|assistant)|my (training|knowledge cutoff)|"
-    r"i('m| am) (not able|unable)|i (cannot|can't) (access|browse|search))"
-)
+CITATION_PATTERN = re.compile(r"\[Source:\s*([^\|\]]+?)\s*\|\s*Chunk:\s*(\d+)\]")
 
 
 def validate_citations(answer: str, sources: list[dict]) -> str:
@@ -38,25 +28,22 @@ def validate_citations(answer: str, sources: list[dict]) -> str:
         logger.warning("Removing hallucinated citation: %s", match.group(0))
         return ""
 
-    return _CITATION.sub(_check, answer)
+    return CITATION_PATTERN.sub(_check, answer)
 
 
 def check_pii(answer: str, source_texts: list[str]) -> str:
     """
-    Warn if PII appears in the answer that was NOT in the source texts.
-    Emails in source docs are acceptable to surface.
+    Redact structured PHI/PII (SSN, card, phone, MRN, dates, ...) that appears
+    in the answer but NOT in the source texts. In a PHI-protected collection the
+    sources are already pseudonymized, so any raw identifier in the answer was
+    hallucinated or recalled from training data, and gets redacted.
     """
     source_blob = " ".join(source_texts)
-
-    def _flag(match: re.Match, label: str) -> str:
-        value = match.group(0)
-        if value in source_blob:
-            return value  # came from a source doc — acceptable
-        logger.warning("Potential %s detected in response: [REDACTED]", label)
-        return f"[{label} REDACTED]"
-
-    answer = _CREDIT_CARD.sub(lambda m: _flag(m, "CREDIT_CARD"), answer)
-    answer = _SSN.sub(lambda m: _flag(m, "SSN"), answer)
+    for span in reversed(detect_structured_phi(answer)):
+        if span.text in source_blob:
+            continue  # came from a source doc — acceptable
+        logger.warning("Potential %s detected in response: [REDACTED]", span.entity_type)
+        answer = answer[: span.start] + f"[{span.entity_type} REDACTED]" + answer[span.end :]
     return answer
 
 

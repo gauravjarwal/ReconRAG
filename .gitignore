@@ -7,3 +7,4 @@ chroma_data/
 dist/
 build/
 .venv/
+phi_vault/
