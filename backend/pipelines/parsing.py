@@ -2,30 +2,46 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
 
-def parse_pdf(data: bytes) -> str:
-    import PyPDF2
+class DocumentParseError(ValueError):
+    """The file could not be turned into text. Message is safe to show the client."""
 
-    reader = PyPDF2.PdfReader(io.BytesIO(data))
-    pages = [page.extract_text() or "" for page in reader.pages]
+
+def parse_pdf(data: bytes) -> str:
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            raise DocumentParseError("PDF is encrypted")
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except PdfReadError as exc:
+        raise DocumentParseError("PDF is corrupt or unreadable") from exc
     return "\n".join(pages)
 
 
 def parse_docx(data: bytes) -> str:
     import docx
 
-    doc = docx.Document(io.BytesIO(data))
-    return "\n".join(para.text for para in doc.paragraphs)
+    try:
+        doc = docx.Document(io.BytesIO(data))
+    except Exception as exc:  # python-docx raises zipfile/KeyError/lxml errors on bad input
+        raise DocumentParseError("DOCX is corrupt or unreadable") from exc
+    parts = [para.text for para in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
 
 
 def parse_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
-
-from typing import Callable
 
 PARSERS: dict[str, Callable[[bytes], str]] = {
     ".pdf": parse_pdf,
@@ -36,12 +52,17 @@ PARSERS: dict[str, Callable[[bytes], str]] = {
 
 ALLOWED_EXTENSIONS = set(PARSERS.keys())
 
+
+def file_extension(filename: str) -> str:
+    return "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
 def parse_file(filename: str, data: bytes) -> str:
     """Extract raw text from a file given its name and bytes."""
-    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    ext = file_extension(filename)
     parser = PARSERS.get(ext)
     if parser is None:
-        raise ValueError(f"Unsupported file type: {ext!r}")
+        raise DocumentParseError(f"Unsupported file type: {ext!r}")
     text = parser(data)
-    logger.debug("Parsed %s — %d chars", filename, len(text))
+    logger.debug("Parsed %s file — %d chars", ext, len(text))
     return text

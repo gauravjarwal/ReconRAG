@@ -36,18 +36,26 @@ def render_sidebar() -> str | None:
     # Create new collection
     st.sidebar.subheader("Create Collection")
     new_name = st.sidebar.text_input("Collection name", placeholder="my-documents")
+    new_phi = st.sidebar.checkbox(
+        "Contains PHI (de-identify before indexing)",
+        value=True,
+        help="Names, dates, MRNs and other identifiers are replaced with pseudonym tokens before "
+        "anything is embedded or sent to an LLM. Uncheck only for non-patient data.",
+    )
     if st.sidebar.button("Create"):
         if not new_name.strip():
             st.sidebar.warning("Please enter a collection name.")
         else:
             try:
-                api_client.create_collection(new_name.strip())
+                api_client.create_collection(new_name.strip(), phi_protection=new_phi)
                 st.sidebar.success(f"Created '{new_name}'")
                 st.session_state.pop("collections", None)
                 st.rerun()
+            except api_client.ApiError as exc:
+                st.sidebar.error(f"Failed to create collection: {exc.detail}")
             except Exception:
-                logger.error("Failed to create collection '%s'", new_name, exc_info=True)
-                st.sidebar.error("Failed to create collection. It may already exist.")
+                logger.error("Failed to create collection", exc_info=True)
+                st.sidebar.error("Failed to create collection. Check backend connectivity.")
 
     st.sidebar.markdown("---")
 
@@ -63,9 +71,10 @@ def render_sidebar() -> str | None:
         index=0,
     )
 
-    # Show doc count
-    doc_count = next((c["document_count"] for c in collections if c["name"] == selected), 0)
-    st.sidebar.caption(f"{doc_count} chunk(s) indexed")
+    # Show doc count and PHI status
+    info = next((c for c in collections if c["name"] == selected), {})
+    phi_note = " · PHI-protected" if info.get("phi_protection") else ""
+    st.sidebar.caption(f"{info.get('document_count', 0)} chunk(s) indexed{phi_note}")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Retrieval Settings")
@@ -74,5 +83,13 @@ def render_sidebar() -> str | None:
         value=st.session_state.get("reranking_enabled", False),
         help="Re-ranking improves accuracy but adds ~3-5s latency. Disable for faster responses.",
     )
+    if info.get("phi_protection"):
+        st.session_state.reidentify_enabled = st.sidebar.toggle(
+            "Show real identifiers",
+            value=st.session_state.get("reidentify_enabled", False),
+            help="Replace pseudonym tokens with original values. Requires a PHI-access API key; every use is audited.",
+        )
+    else:
+        st.session_state.reidentify_enabled = False
 
     return selected

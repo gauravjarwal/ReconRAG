@@ -10,8 +10,8 @@ from typing import Generator
 # ---------------------------------------------------------------------------
 
 # Claude Haiku 4.5
-CLAUDE_SONNET_INPUT_PER_MTK: float = 1.00
-CLAUDE_SONNET_OUTPUT_PER_MTK: float = 5.00
+CLAUDE_HAIKU_INPUT_PER_MTK: float = 1.00
+CLAUDE_HAIKU_OUTPUT_PER_MTK: float = 5.00
 
 # Gemini 3.1 Flash Lite (reranker + generation fallback)
 GEMINI_FLASH_INPUT_PER_MTK: float = 0.075
@@ -43,7 +43,7 @@ class ActionUsage:
 # ---------------------------------------------------------------------------
 
 def cost_claude(tokens_in: int, tokens_out: int) -> float:
-    return (tokens_in * CLAUDE_SONNET_INPUT_PER_MTK + tokens_out * CLAUDE_SONNET_OUTPUT_PER_MTK) / 1_000_000
+    return (tokens_in * CLAUDE_HAIKU_INPUT_PER_MTK + tokens_out * CLAUDE_HAIKU_OUTPUT_PER_MTK) / 1_000_000
 
 
 def cost_gemini_flash(tokens_in: int, tokens_out: int) -> float:

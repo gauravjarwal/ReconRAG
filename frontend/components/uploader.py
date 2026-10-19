@@ -23,7 +23,7 @@ def render_uploader(collection_name: str | None) -> None:
     try:
         existing_docs = api_client.list_documents(collection_name)
     except Exception:
-        logger.debug("Could not fetch document list for '%s'", collection_name, exc_info=True)
+        logger.debug("Could not fetch document list", exc_info=True)
         existing_docs = []
 
     if existing_docs:
@@ -51,8 +51,16 @@ def render_uploader(collection_name: str | None) -> None:
                     f"Ingested {result['files_processed']} file(s), "
                     f"{result['chunks_created']} chunk(s) into **{collection_name}**."
                 )
+                for skipped in result.get("skipped", []):
+                    st.warning(f"Skipped `{skipped['filename']}`: {skipped['reason']}")
+                phi_counts = result.get("phi_entities_pseudonymized") or {}
+                if phi_counts:
+                    summary = ", ".join(f"{n} {kind.lower()}" for kind, n in sorted(phi_counts.items()))
+                    st.info(f"De-identified before indexing: {summary}.")
                 # Invalidate collection cache so doc count refreshes
                 st.session_state.pop("collections", None)
+            except api_client.ApiError as exc:
+                st.error(f"Upload failed: {exc.detail}")
             except Exception:
-                logger.error("Upload failed for collection '%s'", collection_name, exc_info=True)
+                logger.error("Upload failed", exc_info=True)
                 st.error("Upload failed. Check logs for details.")

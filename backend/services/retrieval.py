@@ -1,21 +1,43 @@
 from __future__ import annotations
 
 import logging
+import threading
+
+from chromadb import Collection
 
 from config import settings
 from models.schemas import SourceInfo
-from pipelines.bm25 import bm25_search
+from pipelines.bm25 import Bm25Index, build_index, search_index
 from pipelines.embedding import embed_query
 from pipelines.fusion import reciprocal_rank_fusion
 from pipelines.reranker import rerank
+from pipelines.retry import UpstreamServiceError
 from pipelines.usage import ActionUsage, timed
-from pipelines.vector_store import get_all_chunks, query_collection
+from pipelines.vector_store import collection_revision, get_all_chunks, query_collection
 
 logger = logging.getLogger(__name__)
 
+# collection name -> ((revision, chunk count), index). Rebuilt when either changes.
+_bm25_cache: dict[str, tuple[tuple[int, int], Bm25Index]] = {}
+_bm25_lock = threading.Lock()
+
+NO_RERANK_SCORE = 7.0
+
+
+def _get_bm25_index(collection: Collection) -> Bm25Index:
+    key = (collection_revision(collection.name), collection.count())
+    with _bm25_lock:
+        cached = _bm25_cache.get(collection.name)
+        if cached and cached[0] == key:
+            return cached[1]
+    index = build_index(get_all_chunks(collection))
+    with _bm25_lock:
+        _bm25_cache[collection.name] = (key, index)
+    return index
+
 
 def retrieve(
-    collection: str,
+    collection: Collection,
     question: str,
     reranking: bool = True,
 ) -> tuple[list[SourceInfo], float, list[ActionUsage]]:
@@ -24,13 +46,20 @@ def retrieve(
 
     Returns:
         (sources, best_score, action_usages)
-        sources is empty and best_score is 0.0 if confidence gate blocks.
+        sources is empty if the confidence gate blocks.
         action_usages contains usage for: query_embedding, vector_search, bm25_search, reranking.
+
+    Raises:
+        UpstreamServiceError if the query cannot be embedded.
     """
     action_usages: list[ActionUsage] = []
 
     # 1. Embed query (returns usage)
-    query_embedding, embed_usage = embed_query(question)
+    try:
+        query_embedding, embed_usage = embed_query(question)
+    except Exception as exc:
+        logger.error("Query embedding failed: %s", type(exc).__name__)
+        raise UpstreamServiceError("Embedding service unavailable.") from exc
     action_usages.append(embed_usage)
 
     # Decide fetch size: if reranking, fetch broad candidates; otherwise fetch only top 3
@@ -43,10 +72,9 @@ def retrieve(
     action_usages.append(ActionUsage(action="vector_search", latency_ms=ms[0]))
     logger.debug("Vector search returned %d results", len(vector_results))
 
-    # 3. BM25 search
+    # 3. BM25 search (index cached per collection revision)
     with timed() as ms:
-        all_chunks = get_all_chunks(collection)
-        bm25_results = bm25_search(all_chunks, question, top_k=bm25_k)
+        bm25_results = search_index(_get_bm25_index(collection), question, top_k=bm25_k)
     action_usages.append(ActionUsage(action="bm25_search", latency_ms=ms[0]))
     logger.debug("BM25 search returned %d results", len(bm25_results))
 
@@ -58,18 +86,23 @@ def retrieve(
         return [], 0.0, action_usages
 
     # 5. Rerank or direct top-N
+    reranked = False
     if reranking:
-        scored, rerank_usage = rerank(question, fused)
-        action_usages.append(rerank_usage)
-        top_n = scored[: settings.rerank_top_n]
-    else:
-        # No reranking — take top 3 directly from RRF, assign uniform score
-        top_n = [(chunk, 7.0) for chunk in fused[: settings.rerank_top_n]]
-        logger.info("Reranking disabled — using top %d RRF results directly", settings.rerank_top_n)
+        try:
+            scored, rerank_usage = rerank(question, fused)
+            action_usages.append(rerank_usage)
+            top_n = scored[: settings.rerank_top_n]
+            reranked = True
+        except Exception as exc:
+            # Degrade to RRF order rather than failing the whole query.
+            logger.warning("Re-ranking failed (%s); falling back to RRF order", type(exc).__name__)
+    if not reranked:
+        top_n = [(chunk, NO_RERANK_SCORE) for chunk in fused[: settings.rerank_top_n]]
+        logger.info("Using top %d RRF results without re-ranking", settings.rerank_top_n)
 
-    # 6. Confidence gate (skip when reranking is off — trust RRF results)
+    # 6. Confidence gate (only meaningful with real re-rank scores)
     best_score = top_n[0][1] if top_n else 0.0
-    if reranking and best_score < settings.confidence_threshold:
+    if reranked and best_score < settings.confidence_threshold:
         logger.info("Confidence gate triggered (best score %.2f < %.2f)", best_score, settings.confidence_threshold)
         return [], best_score, action_usages
 
@@ -79,6 +112,7 @@ def retrieve(
             chunk_index=int(chunk["metadata"].get("chunk_index", 0)),
             chunk_text=chunk["metadata"].get("chunk_text", chunk["document"]),
             score=score,
+            injection_risk=bool(chunk["metadata"].get("injection_risk", False)),
         )
         for chunk, score in top_n
     ]

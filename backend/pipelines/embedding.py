@@ -5,11 +5,14 @@ import logging
 import google.generativeai as genai
 
 from config import settings
+from pipelines.retry import with_retries
 from pipelines.usage import ActionUsage, cost_gemini_embedding, estimate_tokens, timed
 
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=settings.google_api_key, transport="rest")
+
+_REQUEST_OPTIONS = {"timeout": settings.llm_timeout_seconds}
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -22,10 +25,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        result = genai.embed_content(
-            model=settings.gemini_embedding_model,
-            content=batch,
-            task_type="retrieval_document",
+        result = with_retries(
+            lambda batch=batch: genai.embed_content(
+                model=settings.gemini_embedding_model,
+                content=batch,
+                task_type="retrieval_document",
+                request_options=_REQUEST_OPTIONS,
+            ),
+            operation="embed_texts",
         )
         all_embeddings.extend(result["embedding"])
 
@@ -45,10 +52,14 @@ def embed_query(text: str) -> tuple[list[float], ActionUsage]:
     Cost uses character-based pricing ($0.00001 / 1K chars).
     """
     with timed() as ms:
-        result = genai.embed_content(
-            model=settings.gemini_embedding_model,
-            content=text,
-            task_type="retrieval_query",
+        result = with_retries(
+            lambda: genai.embed_content(
+                model=settings.gemini_embedding_model,
+                content=text,
+                task_type="retrieval_query",
+                request_options=_REQUEST_OPTIONS,
+            ),
+            operation="embed_query",
         )
 
     estimated_tokens = estimate_tokens(text)

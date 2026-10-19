@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+chroma_data/
+phi_vault/
