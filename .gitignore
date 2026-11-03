@@ -8,3 +8,10 @@ dist/
 build/
 .venv/
 phi_vault/
+.ruff_cache/
+.mypy_cache/
+.coverage
+evals/corpus/generated/
+evals/.cache/
+evals/reports/*.html
+.idea/

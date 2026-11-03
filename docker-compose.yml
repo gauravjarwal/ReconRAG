@@ -1,37 +1,83 @@
-services:
-  backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    volumes:
-      - chroma_data:/app/chroma_data
-      - phi_vault:/app/phi_vault
-    env_file:
-      - .env
-    # DISABLE_SSL_VERIFY is read from .env and is off unless you set it there.
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
-      interval: 30s
-      timeout: 10s
-      start_period: 60s   # NER model load on startup
-      retries: 3
+# Full stack on one machine. Scale with: docker compose up -d --scale api=2 --scale worker=2
+x-app: &app
+  build: .
+  env_file: [.env]
+  environment: &app-env
+    DATABASE_URL: postgresql://reconrag:${POSTGRES_PASSWORD:?run make setup}@postgres:5432/reconrag
+    REDIS_URL: redis://redis:6379/0
+    ENVIRONMENT: prod
+    PHI_NER_ENABLED: "true"
+  volumes: ["blobs:/data/blobs"]
+  restart: unless-stopped
 
-  frontend:
-    build: ./frontend
-    ports:
-      - "8501:8501"
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
     environment:
-      - BACKEND_URL=http://backend:8000
-      - BACKEND_API_KEY=${FRONTEND_API_KEY:?set FRONTEND_API_KEY in .env}
-      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=10
+      POSTGRES_USER: reconrag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run make setup}
+      POSTGRES_DB: reconrag
+    # Parallel HNSW builds allocate from /dev/shm; Docker's default of 64MB fails them.
+    shm_size: 3gb
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reconrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["reconrag", "migrate"]
     depends_on:
-      backend:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["${API_PORT:-8000}:8000"]
+    # Peak was about 1.1GB per replica under load. See docs/BENCHMARKS.md.
+    mem_limit: 2g
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/readyz')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    stop_grace_period: 30s
+
+  worker:
+    <<: *app
+    command: ["reconrag", "worker"]
+    environment:
+      <<: *app-env
+      WORKER_METRICS_PORT: "9100"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    # Set above the idle size of 820MB, not measured under a large OCR job. Tune it on real files.
+    mem_limit: 4g
+    # Long enough for the current job to finish after SIGTERM.
+    stop_grace_period: 330s
+
+  ui:
+    build: ./frontend
+    ports: ["${UI_PORT:-8501}:8501"]
+    environment:
+      BACKEND_URL: http://api:8000
+      BACKEND_API_KEY: ${FRONTEND_API_KEY:?run make setup}
+    depends_on:
+      api: {condition: service_healthy}
     restart: unless-stopped
 
 volumes:
-  chroma_data:
-  # Holds the encrypted pseudonym->PHI mapping. Back it up separately from
-  # chroma_data, and keep PHI_ENCRYPTION_KEY somewhere else entirely.
-  phi_vault:
+  pgdata:
+  blobs:

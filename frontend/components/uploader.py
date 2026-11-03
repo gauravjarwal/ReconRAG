@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 
-import streamlit as st
-
 import api_client
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +42,7 @@ def render_uploader(collection_name: str | None) -> None:
         with st.spinner(f"Ingesting {len(uploaded_files)} file(s)..."):
             try:
                 files = [
-                    (f.name, f.read(), f.type or "application/octet-stream")
-                    for f in uploaded_files
+                    (f.name, f.read(), f.type or "application/octet-stream") for f in uploaded_files
                 ]
                 result = api_client.upload_documents(collection_name, files)
                 st.success(
@@ -55,7 +53,9 @@ def render_uploader(collection_name: str | None) -> None:
                     st.warning(f"Skipped `{skipped['filename']}`: {skipped['reason']}")
                 phi_counts = result.get("phi_entities_pseudonymized") or {}
                 if phi_counts:
-                    summary = ", ".join(f"{n} {kind.lower()}" for kind, n in sorted(phi_counts.items()))
+                    summary = ", ".join(
+                        f"{n} {kind.lower()}" for kind, n in sorted(phi_counts.items())
+                    )
                     st.info(f"De-identified before indexing: {summary}.")
                 # Invalidate collection cache so doc count refreshes
                 st.session_state.pop("collections", None)

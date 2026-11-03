@@ -1,31 +1,22 @@
+"""ReconRAG UI."""
+
 from __future__ import annotations
 
-import streamlit as st
-
 import api_client
+import streamlit as st
 from components.chat import render_chat
+from components.library import render_library
 from components.sidebar import render_sidebar
-from components.uploader import render_uploader
 
-st.set_page_config(
-    page_title="ReconRAG",
-    page_icon="",
-    layout="wide",
-)
+st.set_page_config(page_title="ReconRAG", layout="wide")
 
-# Backend health check
-if not api_client.health_check():
-    st.error("Cannot reach the backend API. Make sure the backend service is running.")
+if not api_client.is_ready():
+    st.error("The API isn't ready. Check that the API and Postgres are running.")
     st.stop()
 
-# Sidebar: collection management
-active_collection = render_sidebar()
-
-# Main area: two tabs
-tab_upload, tab_chat = st.tabs(["Upload Documents", "Chat"])
-
-with tab_upload:
-    render_uploader(active_collection)
-
-with tab_chat:
-    render_chat(active_collection)
+collection = render_sidebar()
+chat_tab, library_tab = st.tabs(["Ask", "Documents"])
+with chat_tab:
+    render_chat(collection)
+with library_tab:
+    render_library(collection)

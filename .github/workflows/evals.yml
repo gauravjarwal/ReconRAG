@@ -1,0 +1,97 @@
+# No API keys here: every step uses local models, so a PR can't spend money.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - name: Unit tests
+        run: uv run pytest -q --cov=evals --cov=reconrag --cov-report=term
+      - name: Dependency audit
+        run: uv export --frozen --no-hashes --no-emit-project -o requirements.audit.txt && uvx pip-audit -r requirements.audit.txt --no-deps --disable-pip --strict
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: quality
+    # Throwaway containers that exist only for this job, so these aren't secrets.
+    # Host ports match docker-compose.dev.yml, which is what the tests expect.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: reconrag
+          POSTGRES_PASSWORD: reconrag
+          POSTGRES_DB: reconrag
+        ports: ["5433:5432"]
+        options: >-
+          --shm-size=3g
+          --health-cmd "pg_isready -U reconrag"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ["6380:6379"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - uses: actions/cache@v6
+        with:
+          path: evals/.cache/models
+          key: embedding-model-${{ hashFiles('src/reconrag/config.py') }}
+      - run: uv sync --frozen
+      - name: Integration tests, including real worker and API processes
+        run: uv run pytest tests/integration -q
+
+  image:
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the API and worker image
+        run: docker build -t reconrag:ci .
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  regression-gate:
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - uses: actions/cache@v6
+        with:
+          path: evals/.cache/models
+          key: embedding-model-${{ hashFiles('evals/harness/embedder.py') }}
+      - run: uv sync --frozen
+      - name: Ingestion and retrieval evals, fail on regression
+        run: make eval-ci

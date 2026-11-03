@@ -1,79 +1,102 @@
+"""A small client for the v2 API. Errors become ApiError with a message safe to show."""
+
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Iterator
+from typing import Any
 
-import requests
+import httpx
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 _HEADERS = {"X-API-Key": os.environ.get("BACKEND_API_KEY", "")}
+_TIMEOUT = httpx.Timeout(30.0, read=120.0)
 
 
 class ApiError(Exception):
-    """Backend returned an error. `detail` is the backend's safe-to-show message."""
-
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(f"{status_code}: {detail}")
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
         self.status_code = status_code
-        self.detail = detail
+        self.message = message
 
 
-def _url(path: str) -> str:
-    return f"{BACKEND_URL}{path}"
-
-
-def _check(resp: requests.Response):
-    if resp.ok:
-        return resp.json()
+def _check(response: httpx.Response) -> Any:
+    if response.is_success:
+        return response.json() if response.content else None
     try:
-        detail = resp.json().get("detail", resp.reason)
-    except ValueError:
-        detail = resp.reason
-    raise ApiError(resp.status_code, detail if isinstance(detail, str) else str(detail))
+        message = response.json()["error"]["message"]
+    except (ValueError, KeyError):
+        message = response.reason_phrase
+    raise ApiError(response.status_code, message)
 
 
-def list_collections() -> list[dict]:
-    return _check(requests.get(_url("/api/collections"), headers=_HEADERS, timeout=10))
+def _client() -> httpx.Client:
+    return httpx.Client(base_url=BACKEND_URL, headers=_HEADERS, timeout=_TIMEOUT)
 
 
-def create_collection(name: str, phi_protection: bool = True) -> dict:
-    return _check(requests.post(
-        _url("/api/collections"),
-        json={"name": name, "phi_protection": phi_protection},
-        headers=_HEADERS,
-        timeout=10,
-    ))
-
-
-def upload_documents(collection_name: str, files: list[tuple[str, bytes, str]]) -> dict:
-    """
-    Args:
-        files: list of (filename, file_bytes, content_type)
-    """
-    multipart = [("files", (name, data, ct)) for name, data, ct in files]
-    return _check(requests.post(
-        _url(f"/api/collections/{collection_name}/documents"),
-        files=multipart,
-        headers=_HEADERS,
-        timeout=300,
-    ))
-
-
-def list_documents(collection_name: str) -> list[str]:
-    return _check(requests.get(_url(f"/api/collections/{collection_name}/documents"), headers=_HEADERS, timeout=10))
-
-
-def query_collection(collection_name: str, question: str, reranking: bool = True, reidentify: bool = False) -> dict:
-    return _check(requests.post(
-        _url(f"/api/collections/{collection_name}/query"),
-        json={"question": question, "reranking": reranking, "reidentify": reidentify},
-        headers=_HEADERS,
-        timeout=120,
-    ))
-
-
-def health_check() -> bool:
+def is_ready() -> bool:
     try:
-        resp = requests.get(_url("/api/health"), timeout=5)
-        return resp.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
+        with _client() as client:
+            return client.get("/readyz").status_code == 200
+    except httpx.HTTPError:
         return False
+
+
+def list_collections() -> list[dict[str, Any]]:
+    with _client() as client:
+        return _check(client.get("/v1/collections"))
+
+
+def create_collection(name: str, phi_protection: bool) -> None:
+    with _client() as client:
+        _check(
+            client.post("/v1/collections", json={"name": name, "phi_protection": phi_protection})
+        )
+
+
+def upload(collection: str, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+    with _client() as client:
+        return _check(
+            client.post(
+                f"/v1/collections/{collection}/documents",
+                files=[("files", file) for file in files],
+            )
+        )
+
+
+def jobs(collection: str, limit: int = 50) -> list[dict[str, Any]]:
+    with _client() as client:
+        response = client.get(f"/v1/collections/{collection}/jobs", params={"limit": limit})
+        return _check(response)["data"]
+
+
+def documents(collection: str, limit: int = 200) -> list[dict[str, Any]]:
+    with _client() as client:
+        response = client.get(f"/v1/collections/{collection}/documents", params={"limit": limit})
+        return _check(response)["data"]
+
+
+def chunk(collection: str, chunk_id: str) -> dict[str, Any]:
+    with _client() as client:
+        return _check(client.get(f"/v1/collections/{collection}/chunks/{chunk_id}"))
+
+
+def ask_stream(
+    collection: str, question: str, reidentify: bool
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yields (event, data) as they arrive."""
+    body = {"question": question, "reidentify": reidentify}
+    with (
+        _client() as client,
+        client.stream("POST", f"/v1/collections/{collection}/query/stream", json=body) as response,
+    ):
+        if not response.is_success:
+            response.read()
+            _check(response)
+        event = ""
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                event = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                yield event, json.loads(line.removeprefix("data: "))

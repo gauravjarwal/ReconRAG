@@ -1,165 +1,117 @@
+"""Streaming chat. Citations show the file, section and page, and open the source passage."""
+
 from __future__ import annotations
 
-import logging
-
-import streamlit as st
+from collections.abc import Iterator
+from typing import Any
 
 import api_client
+import streamlit as st
 
-logger = logging.getLogger(__name__)
-
-
-def _render_sources(sources: list[dict]) -> None:
-    with st.expander(f"Sources & Citations ({len(sources)})"):
-        for i, src in enumerate(sources):
-            score = src.get("score", 0.0)
-            filename = src.get("filename", "unknown")
-            chunk_idx = src.get("chunk_index", 0)
-            chunk_text = src.get("chunk_text", "")
-
-            col1, col2, col3 = st.columns([3, 1, 1])
-            col1.markdown(f"**{filename}**")
-            col2.markdown(f"Chunk: `{chunk_idx}`")
-            col3.markdown(f"Score: `{score:.1f}`")
-
-            preview = chunk_text[:300] + ("..." if len(chunk_text) > 300 else "")
-            st.caption(preview)
-
-            if i < len(sources) - 1:
-                st.markdown("---")
+_WARNINGS = {
+    "unverified_numbers": "Some numbers aren't in the cited sources: {numbers}.",
+    "citations_removed": "A citation to a source that doesn't exist was removed.",
+    "no_citations": "This answer cites no sources, so treat it with care.",
+    "phi_redacted": "An identifier not found in the sources was redacted.",
+    "truncated": "The answer was cut short.",
+    "answers_disabled": "No model is configured, so here are the best passages instead.",
+}
 
 
-def _render_usage(usage: dict | None) -> None:
-    if not usage:
+def _location(source: dict[str, Any]) -> str:
+    parts = [source["filename"]]
+    if source["section"]:
+        parts.append(" › ".join(source["section"]))
+    if source["page_start"]:
+        last = source["page_end"]
+        pages = (
+            source["page_start"]
+            if last == source["page_start"]
+            else f"{source['page_start']}-{last}"
+        )
+        parts.append(f"p. {pages}")
+    return " · ".join(parts)
+
+
+def _render_sources(
+    collection: str, sources: list[dict[str, Any]], cited: list[str], key: str
+) -> None:
+    for source in sources:
+        used = " (not cited)" if cited and source["ref"] not in cited else ""
+        with st.expander(f"[{source['ref']}] {_location(source)}{used}"):
+            if source["injection_risk"]:
+                st.warning("This passage looks like a prompt injection attempt.")
+            st.markdown(source["text"])
+            if source["also_in"]:
+                st.caption("Same text also in: " + ", ".join(source["also_in"]))
+            if st.button("Show surrounding text", key=f"{key}-{source['ref']}"):
+                detail = api_client.chunk(collection, source["chunk_id"])
+                for text in detail["before"]:
+                    st.caption(text)
+                st.markdown(f"**{detail['text']}**")
+                for text in detail["after"]:
+                    st.caption(text)
+
+
+def _render_notes(final: dict[str, Any]) -> None:
+    for warning in final.get("warnings", []):
+        numbers = ", ".join(final.get("unverified_numbers", []))
+        st.warning(_WARNINGS.get(warning, warning).format(numbers=numbers))
+    for item in final.get("degraded", []):
+        st.caption(f"Degraded: {item}")
+    model = final.get("model")
+    total = final.get("stages_ms", {}).get("total")
+    if model:
+        cost = model["cost_usd"]
+        price = f"${cost:.5f}" if cost is not None else "cost unknown"
+        st.caption(
+            f"{model['model']} · first token {model['ttft_ms']:.0f} ms · "
+            f"total {total:.0f} ms · {price}"
+        )
+
+
+def _render_turn(collection: str, turn: dict[str, Any], key: str) -> None:
+    st.chat_message("user").markdown(turn["question"])
+    with st.chat_message("assistant"):
+        st.markdown(turn["answer"] or "")
+        _render_notes(turn["final"])
+        _render_sources(collection, turn["sources"], turn["final"].get("cited", []), key)
+
+
+def _ask(collection: str, question: str, reidentify: bool) -> dict[str, Any]:
+    turn: dict[str, Any] = {"question": question, "sources": [], "final": {}, "answer": ""}
+    st.chat_message("user").markdown(question)
+
+    def tokens() -> Iterator[str]:
+        for event, data in api_client.ask_stream(collection, question, reidentify):
+            if event == "sources":
+                turn["sources"] = data["sources"]
+            elif event == "token":
+                yield data["text"]
+            elif event == "done":
+                turn["final"] = data
+            elif event == "error":
+                raise api_client.ApiError(503, data["message"])
+
+    with st.chat_message("assistant"):
+        streamed = st.write_stream(tokens())
+    turn["answer"] = turn["final"].get("answer") or (streamed if isinstance(streamed, str) else "")
+    return turn
+
+
+def render_chat(collection: dict | None) -> None:
+    if collection is None:
+        st.info("Create a collection in the sidebar first.")
         return
-
-    breakdown: list[dict] = usage.get("breakdown", [])
-    total_tokens = usage.get("total_tokens", 0)
-    total_cost = usage.get("total_cost_usd", 0.0)
-    total_latency = usage.get("total_latency_ms", 0.0)
-
-    with st.expander(
-        f"Token Usage  |  {total_tokens:,} tokens  |  ${total_cost:.6f}  |  {total_latency:.0f} ms"
-    ):
-        # Summary row
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Tokens", f"{total_tokens:,}")
-        col2.metric("Total Cost (USD)", f"${total_cost:.6f}")
-        col3.metric("Total Latency", f"{total_latency:.0f} ms")
-
-        st.markdown("#### Breakdown by Action")
-
-        # Table header
-        hcols = st.columns([2, 1, 1, 1, 1, 1, 1])
-        for col, label in zip(
-            hcols,
-            ["Action", "Tokens In", "Tokens Out", "Total Tokens", "% of Total", "Cost (USD)", "Latency (ms)"],
-        ):
-            col.markdown(f"**{label}**")
-
-        st.markdown("---")
-
-        for row in breakdown:
-            action = row.get("action", "")
-            tok_in = row.get("tokens_in", 0)
-            tok_out = row.get("tokens_out", 0)
-            tok_total = row.get("total_tokens", 0)
-            pct = row.get("pct_of_total_tokens", 0.0)
-            cost = row.get("cost_usd", 0.0)
-            latency = row.get("latency_ms", 0.0)
-
-            rcols = st.columns([2, 1, 1, 1, 1, 1, 1])
-            rcols[0].markdown(f"`{action}`")
-            rcols[1].markdown(str(tok_in))
-            rcols[2].markdown(str(tok_out))
-            rcols[3].markdown(str(tok_total))
-            rcols[4].markdown(f"{pct:.1f}%")
-            rcols[5].markdown(f"${cost:.6f}")
-            rcols[6].markdown(f"{latency:.0f} ms")
-
-
-def _render_message(msg: dict) -> None:
-    role = msg["role"]
-    with st.chat_message(role):
-        st.markdown(msg["content"])
-
-        if role == "assistant":
-            if msg.get("skipped_generation"):
-                st.warning("Insufficient context — could not generate an answer from the available documents.")
-
-            if msg.get("injection_detected"):
-                st.info("Potential prompt injection detected in your query. It was neutralized before processing.")
-
-            if msg.get("phi_protected") and not msg.get("reidentified"):
-                st.caption("Identifiers are shown as pseudonym tokens (e.g. [PERSON_…]).")
-
-            model = msg.get("model_used", "")
-            if model == "gemini-fallback":
-                st.caption("Generated by: Gemini (Claude unavailable)")
-            elif model == "claude":
-                st.caption("Generated by: Claude")
-
-            sources = msg.get("sources", [])
-            if sources:
-                _render_sources(sources)
-
-            _render_usage(msg.get("usage"))
-
-
-def render_chat(collection_name: str | None) -> None:
-    st.subheader("Chat")
-
-    if collection_name is None:
-        st.info("Select a collection in the sidebar to start chatting.")
-        return
-
-    history_key = f"chat_history_{collection_name}"
-    if history_key not in st.session_state:
-        st.session_state[history_key] = []
-
-    history: list[dict] = st.session_state[history_key]
-
-    # Declare chat_input before rendering messages — Streamlit pins it to the bottom
-    question = st.chat_input(f"Ask a question about '{collection_name}'...")
-
-    for msg in history:
-        _render_message(msg)
-
+    name = collection["name"]
+    history: list[dict[str, Any]] = st.session_state.setdefault(f"history-{name}", [])
+    reidentify = collection["phi_protection"] and st.toggle("Show original identifiers")
+    for index, turn in enumerate(history):
+        _render_turn(name, turn, f"{name}-{index}")
+    question = st.chat_input("Ask about these documents")
     if question:
-        user_msg = {"role": "user", "content": question}
-        history.append(user_msg)
-        _render_message(user_msg)
-
-        with st.spinner("Searching and generating answer..."):
-            try:
-                result = api_client.query_collection(
-                    collection_name, question,
-                    reranking=st.session_state.get("reranking_enabled", True),
-                    reidentify=st.session_state.get("reidentify_enabled", False),
-                )
-            except api_client.ApiError as exc:
-                error_msg = {"role": "assistant", "content": f"Error: {exc.detail}", "sources": []}
-                history.append(error_msg)
-                _render_message(error_msg)
-                return
-            except Exception:
-                logger.error("Query failed", exc_info=True)
-                error_msg = {"role": "assistant", "content": "Error: query failed. Check logs for details.", "sources": []}
-                history.append(error_msg)
-                _render_message(error_msg)
-                return
-
-        assistant_msg = {
-            "role": "assistant",
-            "content": result.get("answer", ""),
-            "sources": result.get("sources", []),
-            "confidence": result.get("confidence", 0.0),
-            "model_used": result.get("model_used", ""),
-            "skipped_generation": result.get("skipped_generation", False),
-            "injection_detected": result.get("injection_detected", False),
-            "phi_protected": result.get("phi_protected", False),
-            "reidentified": result.get("reidentified", False),
-            "usage": result.get("usage"),
-        }
-        history.append(assistant_msg)
-        _render_message(assistant_msg)
+        try:
+            history.append(_ask(name, question, reidentify))
+            st.rerun()
+        except api_client.ApiError as exc:
+            st.error(exc.message)

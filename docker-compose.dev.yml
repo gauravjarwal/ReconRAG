@@ -1,0 +1,23 @@
+# Local Postgres and Redis for development and integration tests.
+# Host ports differ from ai-lab's infra compose so both can run together.
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: reconrag
+      POSTGRES_PASSWORD: reconrag
+      POSTGRES_DB: reconrag
+    ports: ["5433:5432"]
+    # Parallel HNSW builds allocate from /dev/shm; Docker's default of 64MB fails them.
+    shm_size: 3gb
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reconrag"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    ports: ["6380:6379"]
+volumes:
+  pgdata:
