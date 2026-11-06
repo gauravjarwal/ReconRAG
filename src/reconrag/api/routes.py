@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator
 from typing import Annotated, Any
 from uuid import UUID
@@ -29,6 +30,8 @@ from reconrag.observability.logs import audit, request_id_var
 from reconrag.observability.metrics import DB_POOL_AVAILABLE, DB_POOL_SIZE, DB_POOL_WAITING
 from reconrag.storage import repo
 from reconrag.worker import queue
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", dependencies=[Depends(deps.current_principal)])
 system = APIRouter()
@@ -272,3 +275,11 @@ def query_stream(
     except ReconRagError as exc:
         # Headers have gone by now, so a failure has to travel as an event.
         yield ServerSentEvent(event="error", data={"code": type(exc).__name__, "message": str(exc)})
+    except Exception:
+        # Any other failure would cut the stream with no terminal event, leaving the client
+        # waiting. Log it in full; send the same generic message as the JSON 500 handler.
+        logger.exception("unhandled error during stream")
+        yield ServerSentEvent(
+            event="error",
+            data={"code": "internal_error", "message": "Something went wrong on our side."},
+        )
